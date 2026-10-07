@@ -1,0 +1,16 @@
+# Data-only NUCLEUS-2 on the staggered grid: baseline for nucleus2_divfree.
+# Same input, backbone, and data loss; no physics in the model or the loss.
+# Use with pydataset=in_mem_divfree_forecast and normalizer_cfg=divfree.
+name: nucleus2_moe_staggered
+train_module_name: staggered_forecast
+layout: "t h w c"
+params:
+  patch_size: 4
+  embed_dim: 512
+  moe_intermediate_dim: 1024
+  processor_blocks: 12
+  num_heads: 8
+  num_experts: 6
+  topk: 2
+  patching: "Linear"
+  activation_dtype: "bfloat16"
