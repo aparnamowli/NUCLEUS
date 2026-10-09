@@ -103,11 +103,12 @@ def test_step_accepts_batch_and_ignores_physics_kwargs(model):
     # The training loop passes x_coords / sim_params_dict for the physics model; the
     # data-only model accepts and ignores them, and a DivFreeBatch carries sim_params.
     torch.manual_seed(0)
-    data = make_input(1, 2, 32, 32)
+    # patch 16 needs >= 3 tokens per side for the 3x3 neighborhood attention, so >= 48 cells
+    data = make_input(1, 2, 64, 64)
     sim_params = torch.randn(1, model.num_sim_params)
     with torch.no_grad():
         direct = model.step(data, sim_params, make_normalizer(),
-                            x_coords=torch.zeros(32), sim_params_dict=[{}])
+                            x_coords=torch.zeros(64), sim_params_dict=[{}])
         batch = DivFreeBatch(input=data, target=None, sim_params=[{}],
                              dx=torch.ones(1), dy=torch.ones(1), sim_params_tensor=sim_params)
         via_batch = model.step(batch)
@@ -124,7 +125,7 @@ def test_registered_model_and_train_module():
 
 def test_forward_trajectory_extends_on_natural_grids(model):
     torch.manual_seed(0)
-    height, width, window = 32, 32, 4
+    height, width, window = 64, 64, 4
     params = {"bulk_temp": 50.0, "sat_temp": 58.0}
     params.update({p: random.random() for p in model.expected_fluid_params if p not in params})
     params["heater"] = {p: random.random() for p in model.expected_heater_params}
