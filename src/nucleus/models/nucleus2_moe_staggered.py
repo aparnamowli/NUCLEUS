@@ -339,6 +339,20 @@ class StaggeredForecastModule(DivFreeForecastModule):
     averaging. No physics-derived targets.
     """
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Weight of the divfree module's SDF-sign BCE term. It uses the physical sdf as
+        # a logit, so it keeps decreasing as |sdf| grows on the correct side; unweighted
+        # it dominates late in training and drives |grad sdf| >> 1 near the interface.
+        # 1.0 reproduces the divfree objective; the staggered config sets 0.0 (pure L1).
+        # Read from model_cfg.params; get_model ignores keys that are not config fields.
+        self.sdf_sign_loss_weight = float(self.model_cfg["params"].get("sdf_sign_loss_weight", 1.0))
+
+    def _sdf_sign_loss(self, output, target) -> torch.Tensor:
+        if self.sdf_sign_loss_weight == 0.0:
+            return output.sdf.new_zeros(())
+        return self.sdf_sign_loss_weight * super()._sdf_sign_loss(output, target)
+
     def _loss_fields(self, output: Nucleus2MoEStaggeredOutput, target: DivFreeData):
         names = ["sdf", "temperature", "velx", "vely"]
         return [getattr(output, n) for n in names], [getattr(target, n) for n in names]
