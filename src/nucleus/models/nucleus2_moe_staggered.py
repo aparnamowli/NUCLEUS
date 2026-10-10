@@ -15,7 +15,8 @@ face field the network produced.
 This file depends on the backbone, the data/physics utilities, and the generic
 training module only. It does not import ``nucleus2_moe_divfree``.
 """
-from dataclasses import dataclass
+import math
+from dataclasses import dataclass, replace
 from typing import List, Optional
 
 import torch
@@ -23,7 +24,7 @@ import torch
 from nucleus.data.in_mem_divfree_forecast_dataset import DivFreeBatch, DivFreeData
 from nucleus.layers.moe.topk_moe import TopkMoEOutput
 from nucleus.models.modules import MoEConditionedForecastModule
-from nucleus.noise import LogUniformNoise
+from nucleus.noise import FieldDropout, LogUniformNoise
 from nucleus.physics.poisson import divergence_centers_from_faces, GRID_SPACING
 from nucleus.trajectory import Trajectory
 from nucleus.utils.inf_stabilizer import clip_temp_by_phase
@@ -181,17 +182,32 @@ class StaggeredForecastModule(MoEConditionedForecastModule):
 
     Loss: mean absolute error over every element of sdf, temperature, velx, vely
     (velocity on the faces, after averaging the two copies of each interior face),
-    plus the MoE router terms. Inputs get additive log-uniform noise, applied to each
-    field on its own grid. No physics-derived targets and no SDF-sign term.
+    plus the MoE router terms. No physics-derived targets and no SDF-sign term.
+
+    Input augmentation, ``model_cfg.params.augmentation``:
+      ``noise`` (default): additive log-uniform noise, scale and skip drawn
+          independently for every field (including psi/phi, which the model ignores).
+      ``cell_centered``: what the cell-centered modules apply to their stacked
+          (B, T, H, W, 4) tensor, carried over to the four fields on their own grids:
+          additive log-uniform noise with one scale and one skip per sample shared by
+          all four fields, then FieldDropout (per sample, each field is a dropout
+          candidate with probability ``active_prob`` and is then zeroed with
+          probability ``p``).
     """
 
     LOSS_FIELDS = ("sdf", "temperature", "velx", "vely")
+    INPUT_FIELDS = ("sdf", "temperature", "velx", "vely")
+    AUGMENTATIONS = ("noise", "cell_centered")
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # Fields live on different grids, so the cell-tensor augmentations of
-        # ModuleBase do not apply; only additive noise, per field.
-        self.augmentations = [LogUniformNoise(0.001, 5e-2, skip_prob=0.1)]
+        self.augmentation = self.model_cfg["params"].pop("augmentation", "noise")
+        if self.augmentation not in self.AUGMENTATIONS:
+            raise ValueError(f"augmentation must be one of {self.AUGMENTATIONS}, got {self.augmentation!r}")
+        self.noise = LogUniformNoise(0.001, 5e-2, skip_prob=0.1)
+        self.field_dropout = FieldDropout()  # p=0.1, active_prob=0.4, as in ModuleBase
+        # Kept for code that inspects .augmentations; _augment does the work.
+        self.augmentations = [self.noise] if self.augmentation == "noise" else [self.noise, self.field_dropout]
 
     @staticmethod
     def _model_input(data: DivFreeData) -> StaggeredFields:
@@ -202,12 +218,30 @@ class StaggeredForecastModule(MoEConditionedForecastModule):
         return staggered_to_cells(data.sdf, data.temperature, data.velx, data.vely)
 
     def _augment_field(self, field: torch.Tensor) -> torch.Tensor:
-        augmented = field.unsqueeze(-1)
-        for augmentation in self.augmentations:
-            augmented = augmentation(augmented)
-        return augmented.squeeze(-1)
+        return self.noise(field.unsqueeze(-1)).squeeze(-1)
+
+    @torch.no_grad()
+    def _augment_cell_centered(self, data: DivFreeData) -> DivFreeData:
+        fields = [getattr(data, name) for name in self.INPUT_FIELDS]
+        batch_size, device = fields[0].shape[0], fields[0].device
+        per_sample = (batch_size, 1, 1, 1)
+
+        log_min, log_max = math.log(self.noise.min), math.log(self.noise.max)
+        scale = (torch.rand(batch_size, device=device) * (log_max - log_min) + log_min).exp()
+        apply = torch.rand(batch_size, device=device) >= self.noise.skip_prob
+        amplitude = (scale * apply).view(per_sample)
+        fields = [field + torch.randn_like(field) * amplitude for field in fields]
+
+        n_fields = len(fields)
+        active = torch.rand(batch_size, n_fields, device=device) < self.field_dropout.active_prob
+        keep = (torch.rand(batch_size, n_fields, device=device) > self.field_dropout.p).to(fields[0].dtype)
+        mask = torch.where(active, keep, torch.ones_like(keep))
+        fields = [field * mask[:, i].view(per_sample) for i, field in enumerate(fields)]
+        return replace(data, **dict(zip(self.INPUT_FIELDS, fields)))
 
     def _augment(self, data: DivFreeData) -> DivFreeData:
+        if self.augmentation == "cell_centered":
+            return self._augment_cell_centered(data)
         return data._apply(self._augment_field)
 
     def _field_loss(self, output: Nucleus2MoEStaggeredOutput, target: DivFreeData) -> torch.Tensor:

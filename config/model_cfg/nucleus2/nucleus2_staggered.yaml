@@ -15,3 +15,6 @@ params:
   topk: 2
   patching: "Linear"
   activation_dtype: "bfloat16"
+  # Training-module setting, not a model field: "noise" (default) or "cell_centered"
+  # (shared-scale noise + FieldDropout, as the cell-centered modules). See StaggeredForecastModule.
+  augmentation: noise

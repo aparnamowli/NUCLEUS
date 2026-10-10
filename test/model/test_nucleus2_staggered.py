@@ -201,7 +201,7 @@ def test_checkpoint_round_trip(tmp_path):
             assert torch.equal(value, loaded.state_dict()[key]), key
 
 
-def build_staggered_module():
+def build_staggered_module(extra_overrides=()):
     """Small CPU-sized StaggeredForecastModule from the real configs."""
     with initialize(version_base=None, config_path="../../config"):
         cfg = compose(
@@ -218,6 +218,7 @@ def build_staggered_module():
                 "model_cfg.params.topk=1",
                 "model_cfg.params.moe_intermediate_dim=32",
                 "model_cfg.params.activation_dtype=float32",
+                *extra_overrides,
             ],
         )
     Module = get_train_module(cfg.model_cfg.train_module_name)
@@ -302,3 +303,52 @@ def test_validation_step_runs():
             loss = module.validation_step(batch, 0)
         assert torch.isfinite(loss) and loss > 0
     run()
+
+
+def test_unknown_augmentation_is_rejected():
+    with pytest.raises(ValueError):
+        build_staggered_module(["model_cfg.params.augmentation=flip"])
+
+
+def test_cell_centered_augmentation_drops_whole_fields():
+    module = build_staggered_module(["model_cfg.params.augmentation=cell_centered"])
+    module.noise.skip_prob = 1.0           # no noise
+    module.field_dropout.active_prob = 1.0
+    module.field_dropout.p = 1.0           # every field dropped
+    data = make_data(3, 2, 8, 6)
+    out = module._augment(data)
+    for name in ("sdf", "temperature", "velx", "vely"):
+        assert torch.all(getattr(out, name) == 0), name
+    # psi/phi are not model inputs and are left alone.
+    assert torch.equal(out.psi, data.psi) and torch.equal(out.phi, data.phi)
+
+
+def test_cell_centered_noise_scale_is_shared_across_fields():
+    torch.manual_seed(0)
+    module = build_staggered_module(["model_cfg.params.augmentation=cell_centered"])
+    module.noise.skip_prob = 0.0
+    module.field_dropout.active_prob = 0.0  # no dropout
+    batch_size = 4
+    data = make_data(batch_size, 2, 96, 96)
+    out = module._augment(data)
+    stds = torch.stack([
+        (getattr(out, name) - getattr(data, name)).flatten(1).std(dim=1)
+        for name in ("sdf", "temperature", "velx", "vely")
+    ])  # (fields, batch)
+    # Within a sample every field gets the same noise scale ...
+    assert torch.allclose(stds, stds[0:1].expand_as(stds), rtol=0.05)
+    # ... and the scale is drawn per sample (log-uniform over [1e-3, 5e-2]).
+    assert stds[0].max() / stds[0].min() > 1.5
+
+
+def test_staggered_standard_normalizer_matches_standard():
+    from omegaconf import OmegaConf
+    from nucleus.data.normalize import StandardNormalizer, get_normalizer
+    cfg_dir = pathlib.Path(__file__).resolve().parents[2] / "config" / "normalizer_cfg"
+    load = lambda name: OmegaConf.to_container(OmegaConf.load(cfg_dir / f"{name}.yaml"), resolve=True)
+    staggered, standard = load("staggered_standard"), load("standard")
+    assert isinstance(get_normalizer(staggered), StandardNormalizer)
+    for key, value in standard.items():
+        assert staggered[key] == value, key
+    for key in ("psi_mean", "psi_std", "phi_mean", "phi_std"):
+        assert staggered[key] is not None
