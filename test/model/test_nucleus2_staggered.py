@@ -172,8 +172,9 @@ def _imported_modules(path: pathlib.Path) -> set:
 def test_does_not_depend_on_divfree(filename):
     # The data-only model and the shared backbone must not import the physics model:
     # a change there should not be able to change this model or its checkpoints.
+    # (The divfree *dataset* module is fine: it holds the shared data containers.)
     imported = _imported_modules(MODELS_DIR / filename)
-    assert not any("divfree" in name for name in imported), imported
+    assert not any(name.endswith("nucleus2_moe_divfree") for name in imported), imported
 
 
 def test_backbone_parameters_match_divfree():
@@ -195,7 +196,9 @@ def test_checkpoint_round_trip(tmp_path):
     path = tmp_path / "model.pt"
     torch.save(model.state_dict(), path)
     loaded = load_model_from_checkpoint(str(path))
-    assert loaded.config == model.config
+    # Loading turns dtype strings into torch.dtype; compare the serialized form.
+    from nucleus.models.nucleus2_moe_staggered_backbone import config_to_dict
+    assert config_to_dict(loaded.config) == config_to_dict(model.config)
     for key, value in model.state_dict().items():
         if key != "_extra_state":
             assert torch.equal(value, loaded.state_dict()[key]), key
@@ -277,7 +280,7 @@ def test_training_loss_is_data_plus_router_only():
     # The training objective is the L1 data loss plus the router terms, nothing else.
     torch.manual_seed(0)
     module = build_staggered_module()
-    module.augmentations = []
+    module.noise.skip_prob = 1.0  # no input noise (the noise is drawn but multiplied by 0)
     module.model.eval()  # no drop-path, so the two forward passes agree
     batch = make_batch(2, 2, 64, 64, module.model.num_sim_params)
 
