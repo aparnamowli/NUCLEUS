@@ -1,5 +1,6 @@
 # Data-only NUCLEUS-2 on the staggered grid: baseline for nucleus2_divfree.
-# Same input, backbone, and data loss; no physics in the model or the loss.
+# Same input and backbone (nucleus2_moe_staggered_backbone); L1 data loss plus router
+# terms, no physics in the model or the loss, no SDF-sign term.
 # Use with pydataset=in_mem_divfree_forecast and normalizer_cfg=divfree.
 name: nucleus2_moe_staggered
 train_module_name: staggered_forecast
@@ -14,7 +15,3 @@ params:
   topk: 2
   patching: "Linear"
   activation_dtype: "bfloat16"
-  # Training-module setting, not a model field. 0.0 = pure L1 data loss. The divfree
-  # module's SDF-sign BCE (weight 1.0) drives |grad sdf| ~ 40 near the interface in
-  # this model and breaks rollouts; see StaggeredForecastModule.
-  sdf_sign_loss_weight: 0.0

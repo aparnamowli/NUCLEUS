@@ -1,42 +1,39 @@
 """NUCLEUS-2 MoE on the staggered (MAC) grid, data-only.
 
 Baseline for the physics-constrained divergence-free model (``nucleus2_moe_divfree``):
-the same staggered input, backbone, and training objective on the data fields, with
-no physics in the model or the loss -- no temperature ansatz, no Leray/Poisson split,
-no divergence-source head, no Helmholtz targets.
+the same staggered input and backbone (:mod:`nucleus2_moe_staggered_backbone`), with no
+physics in the model or the loss -- no temperature ansatz, no Leray/Poisson split, no
+divergence-source head, no Helmholtz targets, no SDF-sign loss.
 
 Velocity is predicted on the faces. The head outputs, per cell, the velocity on its
 four faces (left, right, bottom, top), the same per-cell split the input uses
-(:func:`divfree_input_to_cells`). Every interior face is predicted twice, once by each
-of its two cells; the face value is the average of the two. Wall faces have a single
+(:func:`staggered_to_cells`). Every interior face is predicted twice, once by each of
+its two cells; the face value is the average of the two. Wall faces have a single
 owner. The divergence of the output is then the exact discrete MAC divergence of the
 face field the network produced.
+
+This file depends on the backbone, the data/physics utilities, and the generic
+training module only. It does not import ``nucleus2_moe_divfree``.
 """
-import dataclasses
 from dataclasses import dataclass
 from typing import List, Optional
 
 import torch
-import torch.nn as nn
-from torch.profiler import record_function
-from rotary_embedding_torch import RotaryEmbedding
 
-from nucleus.layers import LinearEmbed, LinearDebed, AdaptiveEmbed, AdaptiveDebed
-from nucleus.layers.moe.topk_moe import TopkMoEOutput
 from nucleus.data.in_mem_divfree_forecast_dataset import DivFreeBatch, DivFreeData
-from nucleus.physics.poisson import divergence_centers_from_faces
+from nucleus.layers.moe.topk_moe import TopkMoEOutput
+from nucleus.models.modules import MoEConditionedForecastModule
+from nucleus.noise import LogUniformNoise
+from nucleus.physics.poisson import divergence_centers_from_faces, GRID_SPACING
 from nucleus.trajectory import Trajectory
 from nucleus.utils.inf_stabilizer import clip_temp_by_phase
-from nucleus.models.nucleus2_moe_divfree import (
-    GRADIENT_SPACING,
-    NUCLEUS_DTYPE,
-    DivFreeForecastModule,
-    Nucleus2MoEDivFreeInput,
-    TransformerMoEBlock,
-    divfree_input_to_cells,
-    get_dtype,
-    _DTYPE_TO_STR,
-    _STR_TO_DTYPE,
+from nucleus.models.nucleus2_moe_staggered_backbone import (
+    Nucleus2MoEStaggeredBackbone,
+    Nucleus2MoEStaggeredBackboneConfig,
+    StaggeredFields,
+    config_from_dict,
+    faces_from_cell_split,
+    staggered_to_cells,
 )
 
 from ._api import register_model
@@ -50,76 +47,17 @@ __all__ = [
     "faces_from_cell_split",
 ]
 
-_DTYPE_FIELDS = ("embed_dtype", "debed_dtype", "activation_dtype", "attention_dtype", "moe_dtype")
+# Grid spacing used for the divergence diagnostic, in normalized units.
+GRADIENT_SPACING = GRID_SPACING
 
 
 @dataclass
-class Nucleus2MoEStaggeredConfig:
-    patch_size: int
-    embed_dim: int
-    num_heads: int
-    processor_blocks: int
-    num_experts: int
-    topk: int
-    moe_intermediate_dim: int
-    patching: str  # "Linear" or "Adaptive"
-    embed_dtype: NUCLEUS_DTYPE = "float32"
-    debed_dtype: NUCLEUS_DTYPE = "float32"
-    activation_dtype: NUCLEUS_DTYPE = "float32"
-    attention_dtype: NUCLEUS_DTYPE = "bfloat16"
-    moe_dtype: NUCLEUS_DTYPE = "bfloat16"
-
-
-def _config_to_dict(config: Nucleus2MoEStaggeredConfig) -> dict:
-    d = dataclasses.asdict(config)
-    for key in _DTYPE_FIELDS:
-        if not isinstance(d[key], str):
-            d[key] = _DTYPE_TO_STR[d[key]]
-    return d
+class Nucleus2MoEStaggeredConfig(Nucleus2MoEStaggeredBackboneConfig):
+    pass
 
 
 def _config_from_dict(d: dict) -> Nucleus2MoEStaggeredConfig:
-    d = dict(d)
-    for key in _DTYPE_FIELDS:
-        if not isinstance(d[key], torch.dtype):
-            d[key] = _STR_TO_DTYPE[d[key]]
-    return Nucleus2MoEStaggeredConfig(**d)
-
-
-def faces_from_cell_split(
-    vel_left: torch.Tensor,
-    vel_right: torch.Tensor,
-    vel_bottom: torch.Tensor,
-    vel_top: torch.Tensor,
-):
-    """Inverse of the per-cell face split in :func:`divfree_input_to_cells`.
-
-    Each interior face appears twice, as the right/top face of one cell and the
-    left/bottom face of its neighbor; its value is the average of the two. Wall faces
-    have one owner and take its value.
-
-    Args (leading dims written ``...``): four ``(..., H, W)`` tensors.
-
-    Returns:
-        ``velx`` ``(..., H, W+1)`` and ``vely`` ``(..., H+1, W)``.
-    """
-    velx = torch.cat(
-        (
-            vel_left[..., :, :1],
-            0.5 * (vel_right[..., :, :-1] + vel_left[..., :, 1:]),
-            vel_right[..., :, -1:],
-        ),
-        dim=-1,
-    )
-    vely = torch.cat(
-        (
-            vel_bottom[..., :1, :],
-            0.5 * (vel_top[..., :-1, :] + vel_bottom[..., 1:, :]),
-            vel_top[..., -1:, :],
-        ),
-        dim=-2,
-    )
-    return velx, vely
+    return config_from_dict(Nucleus2MoEStaggeredConfig, d)
 
 
 @dataclass
@@ -137,122 +75,31 @@ class Nucleus2MoEStaggeredOutput:
 
     def to_cell_tensor(self) -> torch.Tensor:
         """The same six cell channels the model consumes (for logging/plotting)."""
-        return divfree_input_to_cells(self.sdf, self.temperature, self.velx, self.vely)
+        return staggered_to_cells(self.sdf, self.temperature, self.velx, self.vely)
 
 
-class Nucleus2MoEStaggeredBase(nn.Module):
+class Nucleus2MoEStaggeredBase(Nucleus2MoEStaggeredBackbone):
     """Uncompiled model. Use this class directly when forward hooks are needed
     (``torch.compile(fullgraph=True)`` does not run them); the registered
     ``nucleus2_moe_staggered`` is this class compiled, with identical weights."""
 
     config_class = Nucleus2MoEStaggeredConfig
-    config_from_dict = staticmethod(_config_from_dict)
-    expected_fluid_params = [
-        "inv_reynolds", "cpgas", "mugas", "rhogas", "thcogas",
-        "stefan", "prandtl", "bulk_temp", "sat_temp",
-    ]
-    expected_heater_params = ["wallTemp", "xMin", "xMax"]
-    expected_global_params = ["gravy"]
-    # Input and output channels are the same per-cell split.
-    expected_fields = [
-        "dfun", "temperature",
-        "vel_left", "vel_right", "vel_bottom", "vel_top",
-    ]
-    num_sim_params = len(expected_fluid_params) + len(expected_heater_params) + len(expected_global_params)
-    layout = "t h w c"
     # Rollout code uses this to choose staggered (natural-grid) trajectories.
     staggered_io = True
 
     def __init__(self, config: Nucleus2MoEStaggeredConfig):
-        super().__init__()
-        self.config = config
-        n_fields = len(self.expected_fields)
-
-        self.embed_dtype = get_dtype(config.embed_dtype)
-        self.debed_dtype = get_dtype(config.debed_dtype)
-
-        self.rotary_emb = RotaryEmbedding(
-            dim=(config.embed_dim // config.num_heads) // 3,
-            freqs_for="pixel",
-            max_freq=256,
-            seq_before_head_dim=True,
-        )
-
-        drop_path_probs = torch.linspace(0.0, 0.1, config.processor_blocks)
-        self.blocks = nn.ModuleList([
-            TransformerMoEBlock(
-                config=config,
-                num_sim_params=self.num_sim_params,
-                drop_path_prob=drop_path_probs[idx].item(),
-            )
-            for idx in range(config.processor_blocks)
-        ])
-
-        self.out_norm = nn.RMSNorm(config.embed_dim, dtype=self.debed_dtype)
-
-        assert config.patching in ("Linear", "Adaptive")
-        if config.patching == "Linear":
-            self.embed = LinearEmbed(
-                patch_size=config.patch_size, in_channels=n_fields,
-                embed_dim=config.embed_dim, dtype=self.embed_dtype,
-            )
-            self.debed = LinearDebed(
-                patch_size=config.patch_size, embed_dim=config.embed_dim,
-                out_channels=n_fields, dtype=self.debed_dtype,
-            )
-        else:
-            self.embed = AdaptiveEmbed(
-                in_channels=n_fields, out_channels=config.embed_dim,
-                out_shape=(16, 16), dtype=config.embed_dtype,
-            )
-            self.debed = AdaptiveDebed(
-                in_channels=config.embed_dim, out_channels=n_fields,
-                patch_shape=(16, 16), dtype=config.debed_dtype,
-            )
-
-    def get_extra_state(self):
-        return {"model_name": getattr(self, "_model_name", None), "config": _config_to_dict(self.config)}
-
-    def set_extra_state(self, state):
-        self._model_name = state.get("model_name")
-        self.config = _config_from_dict(state["config"])
+        # Output channels = input channels: sdf, temperature, and the four face copies.
+        super().__init__(config, out_channels=len(self.expected_fields))
 
     def forward(self, batch: DivFreeBatch, normalizer=None) -> Nucleus2MoEStaggeredOutput:
         return self.step(batch)
-
-    def model_step(self, input, sim_params: torch.Tensor):
-        """Backbone: per-cell channels in, per-cell channels out ``(B, T, H, W, 6)``."""
-        cells = divfree_input_to_cells(input.sdf, input.temperature, input.velx, input.vely)
-        assert cells.dtype == torch.float32, f"expected float32, got {cells.dtype}"
-        _, _, h, w, _ = cells.shape
-
-        with record_function("encode"):
-            x = embed = self.embed(cells.to(self.embed_dtype))
-        x = x.to(get_dtype(self.config.activation_dtype))
-
-        with record_function("get_axial_freqs"):
-            with torch.no_grad():
-                _, embed_t, embed_h, embed_w, _ = embed.shape
-                rotary_freqs = self.rotary_emb.get_axial_freqs(embed_t, embed_h, embed_w)[None, :, :, :, None, :]
-
-        moe_outputs = []
-        for idx, blk in enumerate(self.blocks):
-            with record_function(f"block_{idx}"):
-                x, moe_output = blk(x, rotary_freqs, sim_params)
-                moe_outputs.append(moe_output)
-
-        with record_function("debed"):
-            x = self.out_norm(x.to(self.debed_dtype) + embed.to(self.debed_dtype))
-            x = self.debed(x, target_shape=(h, w))
-        return x, moe_outputs
 
     def step(self, input, sim_params: Optional[torch.Tensor] = None, normalizer=None, **unused):
         """One forecast window. ``input`` is a :class:`DivFreeBatch` (which carries the
         conditioning tensor) or any container with ``sdf``, ``temperature``, ``velx``,
         ``vely`` on their natural grids, with ``sim_params`` passed separately. Extra
-        keyword arguments used by the physics model's ``step`` (``x_coords``,
-        ``sim_params_dict``, ...) are accepted and ignored, so both models share the
-        training loop."""
+        keyword arguments are accepted and ignored, so callers written for the divfree
+        model's ``step`` signature also work."""
         if isinstance(input, DivFreeBatch):
             sim_params = input.sim_params_tensor
             input = input.input
@@ -299,7 +146,7 @@ class Nucleus2MoEStaggeredBase(nn.Module):
 
         for _ in range(input_time_window_size, trajectory_steps, output_time_window_size):
             window = trajectory.last(input_time_window_size)
-            model_input = Nucleus2MoEDivFreeInput(
+            model_input = StaggeredFields(
                 sdf=normalizer.normalize_sdf(window.sdf),
                 temperature=normalizer.normalize_temp(window.temp, bulk_temp),
                 velx=normalizer.normalize_velx(window.velx),
@@ -329,38 +176,53 @@ class Nucleus2MoEStaggered(Nucleus2MoEStaggeredBase):
     pass
 
 
-class StaggeredForecastModule(DivFreeForecastModule):
+class StaggeredForecastModule(MoEConditionedForecastModule):
     """Training module for :class:`Nucleus2MoEStaggered`.
 
-    Shares the divfree module's training loop, augmentation, SDF-sign loss, router
-    losses, and output-head diagnostics. The data loss is the divfree module's
-    ``_field_loss`` (mean absolute error over all elements of the listed fields)
-    restricted to the four data fields, with velocity compared on the faces after
-    averaging. No physics-derived targets.
+    Loss: mean absolute error over every element of sdf, temperature, velx, vely
+    (velocity on the faces, after averaging the two copies of each interior face),
+    plus the MoE router terms. Inputs get additive log-uniform noise, applied to each
+    field on its own grid. No physics-derived targets and no SDF-sign term.
     """
+
+    LOSS_FIELDS = ("sdf", "temperature", "velx", "vely")
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # Weight of the divfree module's SDF-sign BCE term. It uses the physical sdf as
-        # a logit, so it keeps decreasing as |sdf| grows on the correct side; unweighted
-        # it dominates late in training and drives |grad sdf| >> 1 near the interface.
-        # 1.0 reproduces the divfree objective; the staggered config sets 0.0 (pure L1).
-        # Read from model_cfg.params; get_model ignores keys that are not config fields.
-        self.sdf_sign_loss_weight = float(self.model_cfg["params"].get("sdf_sign_loss_weight", 1.0))
+        # Fields live on different grids, so the cell-tensor augmentations of
+        # ModuleBase do not apply; only additive noise, per field.
+        self.augmentations = [LogUniformNoise(0.001, 5e-2, skip_prob=0.1)]
 
-    def _sdf_sign_loss(self, output, target) -> torch.Tensor:
-        if self.sdf_sign_loss_weight == 0.0:
-            return output.sdf.new_zeros(())
-        return self.sdf_sign_loss_weight * super()._sdf_sign_loss(output, target)
+    @staticmethod
+    def _model_input(data: DivFreeData) -> StaggeredFields:
+        return StaggeredFields(sdf=data.sdf, temperature=data.temperature, velx=data.velx, vely=data.vely)
 
-    def _loss_fields(self, output: Nucleus2MoEStaggeredOutput, target: DivFreeData):
-        names = ["sdf", "temperature", "velx", "vely"]
-        return [getattr(output, n) for n in names], [getattr(target, n) for n in names]
+    @staticmethod
+    def _data_cell_tensor(data: DivFreeData) -> torch.Tensor:
+        return staggered_to_cells(data.sdf, data.temperature, data.velx, data.vely)
+
+    def _augment_field(self, field: torch.Tensor) -> torch.Tensor:
+        augmented = field.unsqueeze(-1)
+        for augmentation in self.augmentations:
+            augmented = augmentation(augmented)
+        return augmented.squeeze(-1)
+
+    def _augment(self, data: DivFreeData) -> DivFreeData:
+        return data._apply(self._augment_field)
+
+    def _field_loss(self, output: Nucleus2MoEStaggeredOutput, target: DivFreeData) -> torch.Tensor:
+        """MAE over all elements of the loss fields together (fields with more
+        elements, the face velocities, weigh slightly more)."""
+        total_abs_error = sum(
+            (getattr(output, name) - getattr(target, name)).abs().sum() for name in self.LOSS_FIELDS
+        )
+        total_elements = sum(getattr(output, name).numel() for name in self.LOSS_FIELDS)
+        return total_abs_error / total_elements
 
     def _per_field_mae(self, output: Nucleus2MoEStaggeredOutput, target: DivFreeData, prefix: str) -> dict:
         metrics = {
             f"{prefix}/mae_{name}": (getattr(output, name) - getattr(target, name)).abs().mean()
-            for name in ("sdf", "temperature", "velx", "vely")
+            for name in self.LOSS_FIELDS
         }
         # Diagnostic only: discrete divergence of predicted vs. true faces, in units of
         # the normalized velocity per grid spacing. Not part of the loss.
@@ -369,6 +231,42 @@ class StaggeredForecastModule(DivFreeForecastModule):
         metrics[f"{prefix}/mae_divergence"] = (div_pred - div_true).abs().mean()
         return metrics
 
-    @staticmethod
-    def _data_cell_tensor(data: DivFreeData) -> torch.Tensor:
-        return divfree_input_to_cells(data.sdf, data.temperature, data.velx, data.vely)
+    def training_step(self, batch: DivFreeBatch, batch_idx: int) -> torch.Tensor:
+        torch.compiler.cudagraph_mark_step_begin()
+        model_input = self._model_input(self._augment(batch.input))
+        output = self.model.step(model_input, batch.sim_params_tensor)
+
+        data_loss = self._field_loss(output, batch.target)
+        aux_loss, _ = self._router_loss(output.moe_outputs)
+        loss = data_loss + aux_loss
+        self._update_router_bias(output.moe_outputs)
+
+        log_dict = {
+            "train/loss": loss,
+            "train/data_loss": data_loss,
+            "train/step": self.global_step,
+            "train/learning_rate": self.get_current_lr(),
+        }
+        log_dict |= self._per_field_mae(output, batch.target, "train")
+        log_dict = self._moe_metrics(output.moe_outputs, log_dict, "train")
+        self.default_log_dict(log_dict)
+        return loss
+
+    def validation_step(self, batch: DivFreeBatch, batch_idx: int) -> torch.Tensor:
+        output = self.model.step(self._model_input(batch.input), batch.sim_params_tensor)
+        loss = self._field_loss(output, batch.target)
+
+        pred_cells = output.to_cell_tensor()
+        target_cells = self._data_cell_tensor(batch.target)
+        if batch_idx == 0:
+            input_cells = self._data_cell_tensor(batch.input)
+            self.validation_sample = (input_cells.detach(), target_cells.detach(), pred_cells.detach())
+
+        log_dict = {"val/loss": loss, "val/data_loss": loss}
+        log_dict |= self._per_field_mae(output, batch.target, "val")
+        log_dict = self.log_step_metrics(
+            log_dict, pred_cells, target_cells, batch.dx[0].item(), batch.dy[0].item(), "val"
+        )
+        log_dict = self._moe_metrics(output.moe_outputs, log_dict, "val")
+        self.default_log_dict(log_dict)
+        return loss
