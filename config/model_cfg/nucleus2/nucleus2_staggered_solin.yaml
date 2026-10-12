@@ -1,0 +1,25 @@
+# Data-only NUCLEUS-2 on the staggered grid with a solenoidal velocity input:
+# nucleus2_staggered with the input face velocity replaced by its divergence-free (Leray)
+# part. Output and loss unchanged. See nucleus2_moe_staggered_solin.py.
+# Use with pydataset=in_mem_divfree_forecast and a normalizer config that has the
+# velocity constants (staggered_standard or divfree); they are copied into the model
+# config below so the projection runs in physical units.
+name: nucleus2_moe_staggered_solin
+train_module_name: staggered_forecast
+layout: "t h w c"
+params:
+  patch_size: 4
+  embed_dim: 512
+  moe_intermediate_dim: 1024
+  processor_blocks: 12
+  num_heads: 8
+  num_experts: 6
+  topk: 2
+  patching: "Linear"
+  activation_dtype: "bfloat16"
+  velx_mean: ${normalizer_cfg.velx_mean}
+  velx_std: ${normalizer_cfg.velx_std}
+  vely_mean: ${normalizer_cfg.vely_mean}
+  vely_std: ${normalizer_cfg.vely_std}
+  # Training-module setting, not a model field: "noise" (default) or "cell_centered".
+  augmentation: noise
