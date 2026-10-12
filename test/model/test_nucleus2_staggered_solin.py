@@ -73,18 +73,26 @@ def test_step_equals_base_model_on_projected_input():
 
 def test_output_ignores_the_expansion_part_of_the_input():
     # Adding a gradient field with the solver's boundary conditions to the physical input
-    # velocity changes its divergence but not the model output.
+    # velocity changes its divergence but not the projected input, so not the output.
+    # The gradient has the size of the input velocity (as in the data, where the expansion
+    # part is a few percent of it): a much larger one leaves float32 round-off of order
+    # eps * |grad chi| after the projection. All dtypes float32 so the comparison is not
+    # limited by bf16 attention.
     torch.manual_seed(0)
-    model, x = solin_model(), make_input()
+    fp32 = dict(attention_dtype="float32", moe_dtype="float32")
+    model = Nucleus2MoEStaggeredSolinBase(Nucleus2MoEStaggeredSolinConfig(**SMALL, **VEL, **fp32)).eval()
+    x = make_input()
     c = model.config
-    chi = torch.randn(2, 2, 64, 48, dtype=torch.float64)
+    chi = DX * torch.randn(2, 2, 64, 48, dtype=torch.float64)
     gx, gy = grad_faces_from_centers(chi, DX, DX)
     shifted = StaggeredFields(sdf=x.sdf, temperature=x.temperature,
                               velx=x.velx + (gx / c.velx_std).float(), vely=x.vely + (gy / c.vely_std).float())
+    assert divergence_centers_from_faces(gx, gy, DX, DX).abs().max() > 10.0
+    p, q = model.project_input(x), model.project_input(shifted)
+    assert torch.allclose(p.velx, q.velx, atol=1e-5) and torch.allclose(p.vely, q.vely, atol=1e-5)
     sp = torch.randn(2, model.num_sim_params)
     with torch.no_grad():
         a, b = model.step(x, sp), model.step(shifted, sp)
-    assert divergence_centers_from_faces(gx, gy, DX, DX).abs().max() > 1.0
     for f in ("sdf", "temperature", "velx", "vely"):
         assert torch.allclose(getattr(a, f), getattr(b, f), atol=1e-4), f
 
