@@ -80,7 +80,9 @@ def test_output_ignores_the_expansion_part_of_the_input():
     # limited by bf16 attention.
     torch.manual_seed(0)
     fp32 = dict(attention_dtype="float32", moe_dtype="float32")
-    model = Nucleus2MoEStaggeredSolinBase(Nucleus2MoEStaggeredSolinConfig(**SMALL, **VEL, **fp32)).eval()
+    # The attention layers create bf16 weights whatever the config says; cast them too
+    # (as the analysis scripts do).
+    model = Nucleus2MoEStaggeredSolinBase(Nucleus2MoEStaggeredSolinConfig(**SMALL, **VEL, **fp32)).float().eval()
     x = make_input()
     c = model.config
     chi = DX * torch.randn(2, 2, 64, 48, dtype=torch.float64)
