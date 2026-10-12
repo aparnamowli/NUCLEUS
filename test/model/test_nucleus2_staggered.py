@@ -178,9 +178,9 @@ def test_does_not_depend_on_divfree(filename):
 
 
 def test_backbone_parameters_match_divfree():
-    # The divfree model will subclass the backbone with a 5-channel head. Its existing
-    # parameters must be exactly the backbone's (same names and shapes), so its current
-    # checkpoints load after it does. Extra parameters it adds later are allowed.
+    # The divfree model subclasses the backbone with a 5-channel head. Its parameters
+    # must keep the backbone's names and shapes, so checkpoints saved before it did still
+    # load. Extra parameters it adds later are allowed.
     config = small_config()
     backbone = Nucleus2MoEStaggeredBackbone(config, out_channels=5)
     divfree = get_model("nucleus2_moe_divfree", **vars(config))
