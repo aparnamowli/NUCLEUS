@@ -1,7 +1,11 @@
 # Data-only NUCLEUS-2 on the staggered grid: baseline for nucleus2_divfree.
 # Same input and backbone (nucleus2_moe_staggered_backbone); L1 data loss plus router
 # terms, no physics in the model or the loss, no SDF-sign term.
-# Use with pydataset=in_mem_divfree_forecast and normalizer_cfg=divfree.
+# Use with pydataset=in_mem_divfree_forecast and normalizer_cfg=staggered_standard.
+# Baseline setting (standard normalizer + cell_centered augmentation) was chosen from a
+# 2x2 ablation over normalizer (divfree, staggered_standard) and augmentation (noise,
+# cell_centered) on single-bubble FC-72; it matches the cell-centered nucleus2 in one-step
+# error and is at least as good in rollouts.
 name: nucleus2_moe_staggered
 train_module_name: staggered_forecast
 layout: "t h w c"
@@ -15,6 +19,6 @@ params:
   topk: 2
   patching: "Linear"
   activation_dtype: "bfloat16"
-  # Training-module setting, not a model field: "noise" (default) or "cell_centered"
-  # (shared-scale noise + FieldDropout, as the cell-centered modules). See StaggeredForecastModule.
-  augmentation: noise
+  # Training-module setting, not a model field: "cell_centered" (shared-scale noise +
+  # FieldDropout, as the cell-centered modules) or "noise" (per-field noise). See StaggeredForecastModule.
+  augmentation: cell_centered

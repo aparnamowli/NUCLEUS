@@ -279,7 +279,7 @@ def test_field_loss_is_mae_over_the_four_fields():
 def test_training_loss_is_data_plus_router_only():
     # The training objective is the L1 data loss plus the router terms, nothing else.
     torch.manual_seed(0)
-    module = build_staggered_module()
+    module = build_staggered_module(["model_cfg.params.augmentation=noise"])  # no field dropout
     module.noise.skip_prob = 1.0  # no input noise (the noise is drawn but multiplied by 0)
     module.model.eval()  # no drop-path, so the two forward passes agree
     batch = make_batch(2, 2, 64, 64, module.model.num_sim_params)
