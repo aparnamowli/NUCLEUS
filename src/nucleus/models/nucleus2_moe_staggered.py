@@ -1,20 +1,5 @@
-"""NUCLEUS-2 MoE on the staggered (MAC) grid, data-only.
-
-Baseline for the physics-constrained divergence-free model (``nucleus2_moe_divfree``):
-the same staggered input and backbone (:mod:`nucleus2_moe_staggered_backbone`), with no
-physics in the model or the loss -- no temperature ansatz, no Leray/Poisson split, no
-divergence-source head, no Helmholtz targets, no SDF-sign loss.
-
-Velocity is predicted on the faces. The head outputs, per cell, the velocity on its
-four faces (left, right, bottom, top), the same per-cell split the input uses
-(:func:`staggered_to_cells`). Every interior face is predicted twice, once by each of
-its two cells; the face value is the average of the two. Wall faces have a single
-owner. The divergence of the output is then the exact discrete MAC divergence of the
-face field the network produced.
-
-This file depends on the backbone, the data/physics utilities, and the generic
-training module only. It does not import ``nucleus2_moe_divfree``.
-"""
+"""Data-only NUCLEUS-2 on the staggered (MAC) grid: the backbone with a head that
+predicts sdf, temperature and face velocities, trained on an L1 data loss."""
 import math
 from dataclasses import dataclass, replace
 from typing import List, Optional
@@ -178,22 +163,10 @@ class Nucleus2MoEStaggered(Nucleus2MoEStaggeredBase):
 
 
 class StaggeredForecastModule(MoEConditionedForecastModule):
-    """Training module for :class:`Nucleus2MoEStaggered`.
-
-    Loss: mean absolute error over every element of sdf, temperature, velx, vely
-    (velocity on the faces, after averaging the two copies of each interior face),
-    plus the MoE router terms. No physics-derived targets and no SDF-sign term.
-
-    Input augmentation, ``model_cfg.params.augmentation``:
-      ``noise`` (default): additive log-uniform noise, scale and skip drawn
-          independently for every field (including psi/phi, which the model ignores).
-      ``cell_centered``: what the cell-centered modules apply to their stacked
-          (B, T, H, W, 4) tensor, carried over to the four fields on their own grids:
-          additive log-uniform noise with one scale and one skip per sample shared by
-          all four fields, then FieldDropout (per sample, each field is a dropout
-          candidate with probability ``active_prob`` and is then zeroed with
-          probability ``p``).
-    """
+    """L1 over sdf, temperature and face velocities plus the router terms.
+    ``model_cfg.params.augmentation``: ``cell_centered`` (one noise scale per sample
+    shared by all fields, then FieldDropout, as the cell-centered modules) or ``noise``
+    (independent noise per field)."""
 
     LOSS_FIELDS = ("sdf", "temperature", "velx", "vely")
     INPUT_FIELDS = ("sdf", "temperature", "velx", "vely")

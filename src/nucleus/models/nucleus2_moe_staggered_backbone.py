@@ -1,20 +1,5 @@
-"""Shared architecture for NUCLEUS-2 models on the staggered (MAC) grid.
-
-The backbone owns the layers and the token pipeline only: the per-cell input split,
-patch embedding, rotary frequencies, the MoE transformer blocks, the output norm, and
-the debed head. It does not define ``step``, ``forward``, rollout, or a training
-module; each model that subclasses it (the data-only ``nucleus2_moe_staggered`` and the
-physics-constrained ``nucleus2_moe_divfree``) defines those itself, so changing one
-model's forward pass or loss cannot change the other's.
-
-Parameter names (``embed``, ``rotary_emb``, ``blocks``, ``out_norm``, ``debed``) are part
-of the checkpoint format. Do not rename them.
-
-Velocity input is on the faces: ``velx`` ``(..., H, W+1)``, ``vely`` ``(..., H+1, W)``.
-:func:`staggered_to_cells` splits each face onto its two bordering cells so the patch
-embedding sees six cell-centered channels; :func:`faces_from_cell_split` is its inverse
-for a head that predicts the same six channels.
-"""
+"""Layers shared by the staggered-grid NUCLEUS-2 models. Subclasses define their own
+step, rollout and training module. Parameter names are part of the checkpoint format."""
 import dataclasses
 from dataclasses import dataclass
 from typing import List, Literal
