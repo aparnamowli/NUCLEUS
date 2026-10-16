@@ -22,8 +22,15 @@ def make_input(b=2, t=8, h=64, w=48) -> StaggeredFields:
 
 
 def model(fixed="", cls=Nucleus2MoEStaggeredBase, cfg=Nucleus2MoEStaggeredConfig, **kw):
+    """A small model with random weights. The conditioning layers are initialized to zero
+    (adaptive layer norm), so at initialization no parameter reaches the output; random
+    weights make the test able to see a parameter's effect."""
     torch.manual_seed(0)
-    return cls(cfg(**SMALL, fixed_params=fixed, **kw)).float().eval()
+    m = cls(cfg(**SMALL, fixed_params=fixed, **kw)).float().eval()
+    with torch.no_grad():
+        for p in m.parameters():
+            p.normal_(0.0, 0.05)
+    return m
 
 
 def index(m, name):
