@@ -58,6 +58,11 @@ class Nucleus2MoEStaggeredConfig(Nucleus2MoEStaggeredBackboneConfig):
     # window are replaced by copies of the oldest frame kept, so the window length and
     # the output window are unchanged. 0 keeps the whole window.
     input_frames: int = 0
+    # Simulation parameters the network does not see: comma-separated names from the
+    # fluid, heater and global parameter lists (e.g. "wallTemp"). Their entries in the
+    # normalized conditioning vector are set to 0 in every call, so the network gets no
+    # information from them. Empty sees every parameter.
+    fixed_params: str = ""
 
 
 def _config_from_dict(d: dict) -> Nucleus2MoEStaggeredConfig:
@@ -94,6 +99,16 @@ class Nucleus2MoEStaggeredBase(Nucleus2MoEStaggeredBackbone):
     def __init__(self, config: Nucleus2MoEStaggeredConfig):
         # Output channels = input channels: sdf, temperature, and the four face copies.
         super().__init__(config, out_channels=len(self.expected_fields))
+        names = self.expected_fluid_params + self.expected_heater_params + self.expected_global_params
+        fixed = [p.strip() for p in config.fixed_params.split(",") if p.strip()]
+        unknown = sorted(set(fixed) - set(names))
+        if unknown:
+            raise ValueError(f"fixed_params: unknown {unknown}; known {names}")
+        # Not saved in the state dict, so checkpoints load with or without the field.
+        self.register_buffer(
+            "fixed_param_index", torch.tensor([names.index(p) for p in fixed], dtype=torch.long),
+            persistent=False,
+        )
 
     def forward(self, batch: DivFreeBatch, normalizer=None) -> Nucleus2MoEStaggeredOutput:
         return self.step(batch)
@@ -113,6 +128,12 @@ class Nucleus2MoEStaggeredBase(Nucleus2MoEStaggeredBackbone):
         return StaggeredFields(sdf=keep(input.sdf), temperature=keep(input.temperature),
                                velx=keep(input.velx), vely=keep(input.vely))
 
+    def fix_params(self, sim_params: torch.Tensor) -> torch.Tensor:
+        """``sim_params`` with the ``config.fixed_params`` entries set to 0."""
+        if self.fixed_param_index.numel() == 0:
+            return sim_params
+        return sim_params.index_fill(-1, self.fixed_param_index, 0.0)
+
     def step(self, input, sim_params: Optional[torch.Tensor] = None, normalizer=None, **unused):
         """One forecast window. ``input`` is a :class:`DivFreeBatch` (which carries the
         conditioning tensor) or any container with ``sdf``, ``temperature``, ``velx``,
@@ -125,6 +146,7 @@ class Nucleus2MoEStaggeredBase(Nucleus2MoEStaggeredBackbone):
         assert sim_params is not None and sim_params.dtype == torch.float32
         if self.config.input_frames > 0:
             input = self.keep_recent_frames(input)
+        sim_params = self.fix_params(sim_params)
 
         x, moe_outputs = self.model_step(input, sim_params)
         sdf, temperature, vel_left, vel_right, vel_bottom, vel_top = x.float().unbind(-1)
