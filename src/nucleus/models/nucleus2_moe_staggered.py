@@ -54,7 +54,10 @@ GRADIENT_SPACING = GRID_SPACING
 
 @dataclass
 class Nucleus2MoEStaggeredConfig(Nucleus2MoEStaggeredBackboneConfig):
-    pass
+    # Number of most recent input frames the network sees. The earlier frames of the
+    # window are replaced by copies of the oldest frame kept, so the window length and
+    # the output window are unchanged. 0 keeps the whole window.
+    input_frames: int = 0
 
 
 def _config_from_dict(d: dict) -> Nucleus2MoEStaggeredConfig:
@@ -95,6 +98,21 @@ class Nucleus2MoEStaggeredBase(Nucleus2MoEStaggeredBackbone):
     def forward(self, batch: DivFreeBatch, normalizer=None) -> Nucleus2MoEStaggeredOutput:
         return self.step(batch)
 
+    def keep_recent_frames(self, input) -> StaggeredFields:
+        """The input with every frame before the last ``config.input_frames`` replaced by
+        the oldest frame kept. Time is dimension 1."""
+        n = self.config.input_frames
+
+        def keep(a):
+            t = a.shape[1]
+            if n <= 0 or n >= t:
+                return a
+            oldest = a[:, t - n:t - n + 1].expand(-1, t - n, *a.shape[2:])
+            return torch.cat([oldest, a[:, t - n:]], dim=1)
+
+        return StaggeredFields(sdf=keep(input.sdf), temperature=keep(input.temperature),
+                               velx=keep(input.velx), vely=keep(input.vely))
+
     def step(self, input, sim_params: Optional[torch.Tensor] = None, normalizer=None, **unused):
         """One forecast window. ``input`` is a :class:`DivFreeBatch` (which carries the
         conditioning tensor) or any container with ``sdf``, ``temperature``, ``velx``,
@@ -105,6 +123,8 @@ class Nucleus2MoEStaggeredBase(Nucleus2MoEStaggeredBackbone):
             sim_params = input.sim_params_tensor
             input = input.input
         assert sim_params is not None and sim_params.dtype == torch.float32
+        if self.config.input_frames > 0:
+            input = self.keep_recent_frames(input)
 
         x, moe_outputs = self.model_step(input, sim_params)
         sdf, temperature, vel_left, vel_right, vel_bottom, vel_top = x.float().unbind(-1)
